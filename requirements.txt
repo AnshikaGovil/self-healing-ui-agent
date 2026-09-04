@@ -1,0 +1,11 @@
+# The API layer.
+fastapi>=0.110.0               # MIT         HTTP API
+uvicorn[standard]>=0.29.0      # BSD-3       ASGI server
+pydantic>=2.6.0                # MIT         request/response validation
+
+# The accelerator half. Only this host loads a model; the bots that call it
+# need none of the following.
+sentence-transformers>=2.7.0   # Apache-2.0  semantic signal (all-MiniLM-L6-v2)
+torch>=2.2.0                   # BSD-3       encoder backend
+numpy>=1.26.0                  # BSD-3
+llama-cpp-python>=0.3.0        # MIT         GGUF runtime (llama.cpp)

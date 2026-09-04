@@ -1,0 +1,18 @@
+# Model weights are provisioned per host, never committed.
+models/
+*.gguf
+
+# Virtual environments
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Local runtime output
+artifacts/
+*.log
