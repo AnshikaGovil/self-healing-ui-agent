@@ -116,14 +116,40 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Provision a model — any instruction-tuned GGUF that llama.cpp can load. A 3-8B
-model at 4-bit is the right size band; the task is choosing an index from a
-shortlist of eight, not writing code:
+### Getting the weights
+
+**The model is not in this repository.** A few gigabytes of binary does not
+belong in git, so a fresh clone has no weights and the service will not start
+until it does. One command fixes that.
+
+Any instruction-tuned GGUF that llama.cpp can load will work. A 1.5-8B model
+at 4-bit is the right band — the adjudicator picks an index out of a shortlist
+of eight, which is not a task that needs a large model.
 
 ```bash
-python scripts/provision_model.py --list      # find one already on this machine
-python scripts/provision_model.py --prefer 4b
+# see a few that are known to work
+python scripts/provision_model.py --suggest
+
+# download one (about 1.1 GB, fits a 4 GB card with room to spare)
+python scripts/provision_model.py --hf \
+    Qwen/Qwen2.5-1.5B-Instruct-GGUF/qwen2.5-1.5b-instruct-q4_k_m.gguf
 ```
+
+If the machine already has GGUF models — an Ollama or LM Studio install, say
+— it can source one locally instead of downloading anything:
+
+```bash
+python scripts/provision_model.py --list      # what is already on this machine
+python scripts/provision_model.py --prefer 3b
+python scripts/provision_model.py --source path/to/model.gguf
+```
+
+Any of those routes leaves the weights at `models/healing-adjudicator.gguf`,
+which is what the service loads and what `.gitignore` keeps out of commits.
+The download is written to a `.part` file and renamed only once it is whole,
+so an interrupted transfer leaves nothing rather than a truncated file that
+loads far enough to fail confusingly later. `--url` takes any direct link if
+you host your own weights.
 
 Run it. `--gpu-layers` is the only thing that differs between the two
 deployments:
@@ -295,6 +321,7 @@ healing_service/     the API - this is what runs on the accelerated host
 
 scripts/             provision_model.py, provision_gpu.py
 tests/               two offline suites
+models/              created by provision_model.py - gitignored, never committed
 ```
 
 `bis_core` declares two slots — an encoder and a model — and `healing_service`

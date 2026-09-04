@@ -15,6 +15,7 @@ and must keep working if whatever it was sourced from is uninstalled.
 from __future__ import annotations
 
 import argparse
+import urllib.request
 import json
 import os
 import shutil
@@ -138,6 +139,79 @@ def copy_with_progress(src: str, dst: str) -> None:
     os.replace(tmp, dst)
 
 
+# --------------------------------------------------------------- downloading
+#
+# Discovery only helps a machine that already has a GGUF on it - an Ollama or
+# LM Studio install, usually. A freshly cloned repository on a clean host has
+# nothing to find, and that is the common case for a new inference node, so
+# the script has to be able to fetch one too.
+
+HF_TEMPLATE = "https://huggingface.co/%s/resolve/main/%s"
+
+# Sizes are the 4-bit quantisations. The adjudicator picks an index out of a
+# shortlist of eight, which does not need a large model; anything in this band
+# is a reasonable starting point and the first one fits comfortably on a
+# 4 GB card.
+SUGGESTED = [
+    ("Qwen/Qwen2.5-1.5B-Instruct-GGUF", "qwen2.5-1.5b-instruct-q4_k_m.gguf"),
+    ("bartowski/Qwen2.5-3B-Instruct-GGUF", "Qwen2.5-3B-Instruct-Q4_K_M.gguf"),
+    ("bartowski/Llama-3.2-3B-Instruct-GGUF",
+     "Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+]
+
+
+def download(url: str, dst: str) -> bool:
+    """Stream a GGUF to disk, then move it into place only once it is whole.
+
+    Downloaded beside the target and renamed at the end, so an interrupted
+    transfer leaves no file rather than a truncated one that loads far enough
+    to fail confusingly later.
+    """
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    tmp = dst + ".part"
+    last = [0.0]
+    print("downloading %s" % url)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            with open(tmp, "wb") as out:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if not total:
+                        continue
+                    pct = 100.0 * done / total
+                    # A carriage return is a progress bar on a terminal
+                    # and thirty kilobytes of noise in a build log, so
+                    # only one of those two audiences gets it.
+                    if sys.stdout.isatty():
+                        sys.stdout.write("\r  %5.1f%%  %6.2f / %5.2f GB"
+                                         % (pct, done / 1e9, total / 1e9))
+                        sys.stdout.flush()
+                    elif pct - last[0] >= 10:
+                        last[0] = pct
+                        print("  %3.0f%%  %.2f / %.2f GB"
+                              % (pct, done / 1e9, total / 1e9))
+        if sys.stdout.isatty():
+            print("")
+    except Exception as exc:
+        print("download failed: %s" % exc)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        return False
+
+    if not is_gguf(tmp):
+        print("what arrived is not a GGUF file - discarding it")
+        os.unlink(tmp)
+        return False
+    os.replace(tmp, dst)
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -148,7 +222,44 @@ def main() -> int:
                          "the most recently pulled model wins")
     ap.add_argument("--list", action="store_true", help="show sources and exit")
     ap.add_argument("--force", action="store_true", help="overwrite the target")
+    ap.add_argument("--url", default="",
+                    help="download a .gguf from this URL instead of "
+                         "searching this machine")
+    ap.add_argument("--hf", default="",
+                    help="download from Hugging Face, as 'repo/file.gguf' - "
+                         "e.g. Qwen/Qwen2.5-1.5B-Instruct-GGUF/"
+                         "qwen2.5-1.5b-instruct-q4_k_m.gguf")
+    ap.add_argument("--suggest", action="store_true",
+                    help="print some models known to work, and exit")
     args = ap.parse_args()
+
+    if args.suggest:
+        print("Any instruction-tuned GGUF that llama.cpp can load will work.")
+        print("These are reasonable starting points:\n")
+        for repo, name in SUGGESTED:
+            print("  python scripts/provision_model.py --hf %s/%s" % (repo, name))
+        return 0
+
+    if args.url or args.hf:
+        if os.path.exists(args.target) and not args.force:
+            print("%s already exists - pass --force to replace it" % args.target)
+            return 1
+        url = args.url
+        if not url:
+            repo, _, name = args.hf.rpartition("/")
+            if not repo or not name.endswith(".gguf"):
+                print("--hf wants 'repo/file.gguf', for example:\n"
+                      "  Qwen/Qwen2.5-1.5B-Instruct-GGUF/"
+                      "qwen2.5-1.5b-instruct-q4_k_m.gguf")
+                return 2
+            url = HF_TEMPLATE % (repo, name)
+        if not download(url, args.target):
+            return 1
+        header = gguf_header(args.target)
+        print("ready: %s" % args.target)
+        print("  %.2f GB, GGUF v%s, %d tensors"
+              % (os.path.getsize(args.target) / 1e9, header[0], header[1]))
+        return 0
 
     if args.source:
         source = args.source
@@ -165,7 +276,10 @@ def main() -> int:
                 print("  %-46s %5.2f GB  %s" % (f["label"], f["size_gb"], f["path"]))
             return 0
         if not found:
-            print("no GGUF model found. Pass one explicitly:\n"
+            print("no GGUF model found on this machine.\n\n"
+                  "Download one:\n"
+                  "  python scripts/provision_model.py --suggest\n\n"
+                  "or point at a file you already have:\n"
                   "  python scripts/provision_model.py --source path/to/model.gguf")
             return 1
         if len(found) > 1 and not args.prefer:
