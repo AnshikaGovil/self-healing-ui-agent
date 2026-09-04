@@ -125,10 +125,16 @@ python scripts/provision_model.py --list      # find one already on this machine
 python scripts/provision_model.py --prefer 4b
 ```
 
-Run it:
+Run it. `--gpu-layers` is the only thing that differs between the two
+deployments:
 
 ```bash
+# CPU - works anywhere, nothing further to install
+python -m healing_service --host 0.0.0.0 --port 8077 --gpu-layers 0 --context 4096
+
+# GPU - offload every layer that fits
 python -m healing_service --host 0.0.0.0 --port 8077 --gpu-layers -1 --context 4096
+
 curl http://localhost:8077/v1/health
 ```
 
@@ -139,6 +145,57 @@ mystery:
 ```json
 { "ready": true,
   "ai": { "loaded": true, "device": "gpu", "gpu_offload_supported": true } }
+```
+
+### Running on CPU
+
+CPU is a supported deployment, not a degraded one. `pip install -r
+requirements.txt` already installs a CPU-only llama.cpp build, so the steps
+above are complete as they stand — no driver to match, no CUDA toolkit, no
+further downloads:
+
+```bash
+python -m healing_service --port 8077 --gpu-layers 0 --context 4096
+```
+
+`--gpu-layers 0` forces it explicitly, which is worth doing even on a machine
+that has a GPU when you want a like-for-like comparison. Health then reads:
+
+```json
+{ "ready": true,
+  "ai": { "loaded": true, "device": "cpu",
+          "gpu_offload_supported": true, "gpu_layers_requested": 0 } }
+```
+
+Those last two fields answer different questions, and the distinction is the
+point of reporting both. `gpu_offload_supported` describes the **build** -
+whether this llama.cpp could offload if asked. `device` describes this
+**run**. Seeing `true` and `cpu` together means a capable build was told to
+stay on the CPU, which is what `--gpu-layers 0` does. Seeing `false` means the
+installed wheel has no GPU support compiled in at all, which is the case a
+fleet needs to notice.
+
+Measured with a 4B model at 4-bit: **about 8 s per repair on CPU against
+about 6 s on a 4 GB GPU.** A repair only happens when a selector has already
+broken, so that difference rarely decides anything — and the deterministic
+signals, which do most of the work, cost the same either way.
+
+Two settings matter more on CPU than they look:
+
+* **`--context 4096`, or lower.** The adjudication prompt is a few hundred
+  tokens. A larger context buys nothing and costs memory and
+  prompt-processing time on every request.
+* **`--no-ai` is a supported mode**, not a broken one. It serves the six
+  deterministic signals and the semantic ranking with no language model at
+  all, which is the fastest configuration available. Confidence falls, so
+  more repairs land in the review band and fewer are applied autonomously —
+  that is the honest trade, and the bands are what keep it safe.
+
+To check what a given environment is actually capable of before starting the
+service:
+
+```bash
+python scripts/provision_gpu.py --check
 ```
 
 ### Getting onto a GPU
