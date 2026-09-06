@@ -20,6 +20,7 @@ import logging
 import re
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 log = logging.getLogger("bis.descriptors")
 
@@ -276,6 +277,26 @@ def normalize_text(value, limit: int = 160) -> str:
     return _WS.sub(" ", str(value)).strip()[:limit]
 
 
+def page_scope(url) -> str:
+    """Normalise a URL into a stable key for anything remembered per page.
+
+    Query strings and fragments are dropped: the same page reached with
+    different tracking parameters must not fragment what has been learned
+    about it.
+
+    Lives here rather than beside the memory file because the healing
+    service keeps baselines for thin clients and has to derive exactly the
+    same key the toolkit derives, or a bot would look up its own baseline
+    under a name nothing ever wrote.
+    """
+    try:
+        parsed = urlparse(str(url or ""))
+        path = (parsed.path or "/").rstrip("/") or "/"
+        return "%s%s" % (parsed.netloc, path)
+    except Exception:
+        return str(url or "") or "unknown"
+
+
 KNOWN_LOCATOR_KEYS = frozenset({
     "selector", "description", "tag", "role", "expected_text",
     "scope", "fallbacks", "critical", "multiple",
@@ -378,6 +399,13 @@ class LocatorSpec:
             critical=bool(raw.get("critical", True)),
             multiple=bool(raw.get("multiple", False)),
         )
+
+
+# Keys the browser-side JavaScript emits that are not dataclass field names.
+# Their presence is what tells the two wire shapes apart - see
+# ElementDescriptor.coerce().
+_JS_ONLY_KEYS = ("ariaLabel", "dataAttrs", "accName", "cssPath", "sibIndex",
+                 "neighborText")
 
 
 @dataclass
@@ -534,3 +562,26 @@ class ElementDescriptor:
     def from_dict(cls, raw: Dict[str, Any]) -> "ElementDescriptor":
         allowed = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in raw.items() if k in allowed})
+
+    @classmethod
+    def coerce(cls, raw: Dict[str, Any]) -> "ElementDescriptor":
+        """Build from either wire shape - harvester output or a stored dict.
+
+        The full agent runs from_js() in the bot and sends the *serialised
+        descriptor*; a thin client has no descriptor class and sends the
+        harvester's own output, which names the same facts differently
+        (``id`` for element_id, ``dataAttrs`` for data_attrs, and so on).
+
+        Anything decoding a payload that could have come from either must
+        use this. from_dict() silently drops every key it does not
+        recognise, so a harvester payload decoded with it arrives with no
+        id, no type, no aria-label, no data-* and no accessible name - the
+        exact fields the identity and attribute signals are computed from.
+        That is not a degraded score, it is a wrong one, and it is invisible:
+        the request succeeds and the ranking is quietly built on a third of
+        the evidence.
+        """
+        if not raw:
+            return cls()
+        return (cls.from_js(raw) if any(k in raw for k in _JS_ONLY_KEYS)
+                else cls.from_dict(raw))

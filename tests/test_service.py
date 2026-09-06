@@ -14,6 +14,7 @@ import sys
 
 ROOT_ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT_)
+sys.path.append(os.path.join(os.path.dirname(ROOT_), "bis-core"))
 
 from bis_core.adjudicator import (AdjudicationRequest,      # noqa: E402
                                   LocalAdjudicator,
@@ -268,6 +269,246 @@ def test_an_optional_locator_is_reported_absent_rather_than_repaired_weakly():
     assert required["chosen"] == 0, "a required locator still gets an answer"
     assert optional["chosen"] == -1, "a weak optional repair must not be applied"
     assert "floor" in optional["rationale"]
+
+
+# ------------------------------------------------------------- baselines
+#
+# Structure, geometry, tag and text all compare a candidate against the
+# element the step used while it still worked. A client with no memory has
+# none, those signals return "no opinion", and the repair is scored on the
+# weight that is left. The service keeps baselines so that a thin client
+# does not have to become a stateful thing in order to get them.
+
+
+def _harvested(element_id="firstName"):
+    """One candidate in the shape the browser-side harvester emits."""
+    return {
+        "tag": "input", "id": element_id, "classes": ["form-control"],
+        "name": "", "type": "text", "role": "", "ariaLabel": "",
+        "placeholder": "First Name", "title": "", "alt": "", "href": "",
+        "dataAttrs": {"data-qa": "fname"}, "text": "", "accName": "First Name",
+        "xpath": "/html[1]/body[1]/div[1]/input[1]", "cssPath": "#" + element_id,
+        "ancestors": ["div.form-group"], "depth": 6, "sibIndex": 2,
+        "rect": {"x": 416, "y": 255, "width": 220, "height": 38},
+        "visible": True, "enabled": True, "interactive": True,
+        "neighborText": "First Name", "selectors": ["#" + element_id],
+    }
+
+
+def test_a_harvester_payload_is_not_decoded_as_a_stored_descriptor():
+    """coerce(), not from_dict(), or two thirds of the evidence disappears.
+
+    The full agent runs from_js() in the bot and sends a serialised
+    descriptor; a thin client has no descriptor class and sends the
+    harvester's own output, which names the same facts differently.
+    Decoding the second with from_dict() drops id, type, aria-label, data-*
+    and the accessible name - exactly the fields identity and attributes are
+    scored on - and does it silently: the request succeeds, the ranking is
+    just built on a fraction of the evidence.
+
+    Measured on the live demoqa form, that was the difference between a
+    heuristic score of 0.100 and 0.524 for the same correct element.
+    """
+    raw = _harvested()
+
+    dropped = ElementDescriptor.from_dict(raw)
+    assert dropped.element_id == "", "from_dict is supposed to be strict"
+    assert "first" not in dropped.attribute_tokens()
+
+    kept = ElementDescriptor.coerce(raw)
+    assert kept.element_id == "firstName"
+    assert kept.input_type == "text"
+    assert kept.data_attrs == {"data-qa": "fname"}
+    assert kept.accessible_name == "First Name"
+    assert kept.sibling_index == 2
+    assert "first" in kept.attribute_tokens()
+
+    # ... and the serialised shape still round-trips, or the full agent breaks.
+    assert ElementDescriptor.coerce(kept.to_dict()) == kept
+    assert ElementDescriptor.coerce({}).tag == ""
+
+
+def test_the_store_refuses_a_baseline_that_is_not_on_screen():
+    """No baseline beats a false one.
+
+    Structure and geometry are the signals that make repairs better the
+    longer a fleet runs. Seeding them from a hidden or zero-sized element
+    makes them worse forever, and nothing later in the pipeline can tell.
+    """
+    import tempfile
+    from healing_service.baselines import BaselineStore
+
+    with tempfile.TemporaryDirectory() as folder:
+        store = BaselineStore(os.path.join(folder, "b.json"))
+        url = "https://demoqa.com/automation-practice-form?utm=x"
+
+        hidden = dict(_harvested(), visible=False)
+        assert store.record("form.first_name", url, hidden) is False
+        assert store.get("form.first_name", url) is None
+
+        flat = dict(_harvested(),
+                    rect={"x": 0, "y": 0, "width": 0, "height": 0})
+        assert store.record("form.first_name", url, flat) is False
+
+        assert store.record("form.first_name", url, _harvested()) is True
+        got = store.get("form.first_name", url)
+        assert got and got["element_id"] == "firstName"
+
+
+def test_a_baseline_is_found_again_however_the_page_was_reached():
+    """Keyed by the toolkit's page_scope, so query strings do not fragment it.
+
+    Two bots reaching the same page with different tracking parameters must
+    share one baseline rather than seed two.
+    """
+    import tempfile
+    from healing_service.baselines import BaselineStore
+
+    with tempfile.TemporaryDirectory() as folder:
+        store = BaselineStore(os.path.join(folder, "b.json"))
+        store.record("form.first_name",
+                     "https://demoqa.com/automation-practice-form?a=1",
+                     _harvested())
+        assert store.get("form.first_name",
+                         "https://demoqa.com/automation-practice-form#top")
+        assert store.get("form.first_name", "https://demoqa.com/other") is None
+
+
+def test_baselines_outlive_the_process_that_recorded_them():
+    """One good run has to seed the next one, or nothing has been learned."""
+    import tempfile
+    from healing_service.baselines import BaselineStore
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "b.json")
+        BaselineStore(path).record("form.first_name", "https://demoqa.com/f",
+                                   _harvested())
+        assert BaselineStore(path).get("form.first_name",
+                                       "https://demoqa.com/f")
+
+
+def test_a_corrupt_store_costs_accuracy_not_availability():
+    """Fail open, like everything else. Losing baselines is not losing bots."""
+    import tempfile
+    from healing_service.baselines import BaselineStore
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "b.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        store = BaselineStore(path)
+        assert store.stats()["entries"] == 0
+        assert store.record("k", "https://x.test/p", _harvested()) is True
+
+
+def test_a_reported_baseline_reaches_the_next_adjudication():
+    """The whole point, end to end over HTTP.
+
+    A thin client posts what worked; the next repair for that locator on
+    that page is scored with structure and geometry available, without the
+    client having sent - or stored - anything itself.
+    """
+    import tempfile
+    from fastapi.testclient import TestClient
+    from healing_service import create_app
+
+    with tempfile.TemporaryDirectory() as folder:
+        app = create_app(_config(), warm=False,
+                         baseline_path=os.path.join(folder, "b.json"))
+        with TestClient(app) as client:
+            url = "https://demoqa.com/automation-practice-form"
+            body = {
+                "locator": {"key": "form.first_name",
+                            "selector": "#hr-v2-firstName",
+                            "description": "the First Name box on the form"},
+                "action": "interact",
+                "page": {"url": url, "title": "Practice Form"},
+                "candidates": [_harvested("lastName"), _harvested("firstName")],
+                "use_stored_baseline": True,
+                "protocol": "1",
+            }
+
+            cold = client.post("/v1/adjudicate", json=body).json()
+            cold_signals = cold["shortlist"][0]["signals"]
+            assert cold_signals["structure"] is None
+            assert cold_signals["geometry"] is None
+
+            posted = client.post("/v1/baseline", json={
+                "key": "form.first_name", "selector": "#firstName",
+                "url": url, "descriptor": _harvested(), "protocol": "1"}).json()
+            assert posted["stored"] is True and posted["entries"] == 1
+            assert client.get("/v1/health").json()["baselines"] == 1
+
+            # The same request, with no baseline field - the service supplies
+            # what the fleet learned.
+            warm = client.post("/v1/adjudicate", json=body).json()
+            warm_signals = warm["shortlist"][0]["signals"]
+            assert warm_signals["structure"] is not None
+            assert warm_signals["geometry"] is not None
+            assert warm["confidence"] > cold["confidence"], (
+                "a warm heal that scores no better has learned nothing: "
+                "%.3f vs %.3f" % (warm["confidence"], cold["confidence"]))
+
+            # An old client must be told, not silently ignored.
+            assert client.post("/v1/baseline", json={
+                "key": "k", "url": url, "descriptor": _harvested(),
+                "protocol": "0"}).status_code == 409
+
+
+def test_a_client_with_its_own_memory_is_not_handed_the_fleet_s():
+    """An absent baseline from the full agent is a fact, not a gap.
+
+    The agent keeps its own memory, so `baseline: null` from it means "my
+    memory has none for this locator" - not "I have no memory". Substituting
+    the fleet's would overrule a client that manages its own, and would
+    silently warm the benchmark, which wipes its memory per suite precisely
+    so that every row is a cold heal. A measurement that stops being true
+    without a line of it changing is the worst kind.
+    """
+    import tempfile
+    from fastapi.testclient import TestClient
+    from healing_service import create_app
+
+    with tempfile.TemporaryDirectory() as folder:
+        app = create_app(_config(), warm=False,
+                         baseline_path=os.path.join(folder, "b.json"))
+        with TestClient(app) as client:
+            url = "https://demoqa.com/automation-practice-form"
+            body = {
+                "locator": {"key": "form.first_name",
+                            "selector": "#hr-v2-firstName",
+                            "description": "the First Name box on the form"},
+                "action": "interact",
+                "page": {"url": url, "title": "Practice Form"},
+                "candidates": [_harvested("lastName"), _harvested("firstName")],
+                "protocol": "1",
+            }
+            client.post("/v1/baseline", json={
+                "key": "form.first_name", "selector": "#firstName",
+                "url": url, "descriptor": _harvested(), "protocol": "1"})
+
+            # No use_stored_baseline: the store is full and stays out of it.
+            quiet = client.post("/v1/adjudicate", json=body).json()
+            assert quiet["shortlist"][0]["signals"]["structure"] is None
+
+            asked = client.post("/v1/adjudicate",
+                                json=dict(body, use_stored_baseline=True)).json()
+            assert asked["shortlist"][0]["signals"]["structure"] is not None
+
+
+def test_the_baseline_is_part_of_the_decision_cache_key():
+    """Two requests differing only in the baseline are not the same question.
+
+    The decision cache replays a verdict for an identical request. Leaving
+    the baseline out of the key replays a cold verdict, at its cold
+    confidence, over a warm heal that would have scored higher - and the
+    symptom is a fix that appears not to have worked.
+    """
+    cold = _request()
+    warm = _request()
+    warm.baseline = ElementDescriptor.coerce(_harvested()).to_dict()
+    adjudicator = LocalAdjudicator(_config())
+    assert adjudicator._cache_key(cold) != adjudicator._cache_key(warm)
 
 
 def _run_all():

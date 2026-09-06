@@ -247,7 +247,8 @@ probe simply reports `False`.
 | --- | --- |
 | `POST /v1/adjudicate` | rank a candidate pool and choose one — returns an index |
 | `GET /v1/js` | the in-page JavaScript a thin client executes, plus a content hash |
-| `GET /v1/health` | readiness, device, model, uptime, requests served |
+| `POST /v1/baseline` | what an element looked like while its locator worked, kept for clients with no memory of their own |
+| `GET /v1/health` | readiness, device, model, uptime, requests served, baselines held |
 | `GET /docs` | generated OpenAPI reference |
 
 Set `BIS_API_KEY` (or `--api-key`) to require an `X-API-Key` header. Unset
@@ -258,6 +259,46 @@ logs a warning at startup either way.
 component most likely to need work as real sites change, so it is **served
 rather than embedded**: improving it is a service restart instead of a
 redeploy to every bot in the fleet. Clients cache it against the content hash.
+
+`/v1/baseline` is what keeps a thin client from being permanently cold.
+
+Six of the seven ranking signals compare a candidate against the element the
+step used *while the locator still worked*. Structure and geometry have
+nothing to compare against without such a record; tag and text fall back to
+whatever can be read out of the selector string, which for a bare `#firstName`
+is nothing at all. Signals with no evidence are dropped from the weighted mean
+— correctly, since scoring them zero would punish a repair for being the first
+— so a cold heal is judged on a fraction of the total weight, and correct
+repairs land in the review band and get refused.
+
+A client with its own memory keeps baselines itself and sends one inline. A
+client without one posts what worked to `/v1/baseline` and the service keys it
+by locator and page. Three properties are worth stating:
+
+- **It is shared, and that is the point.** Keys are per locator and per page,
+  not per bot, so the first process to walk a page warms every process that
+  walks it afterwards, including ones on other hosts.
+- **The policy lives in one place.** The store refuses a fingerprint that is
+  not on screen. No baseline beats a false one: seeding structure and geometry
+  from a hidden or zero-sized element makes every later repair worse, and
+  nothing downstream can tell.
+- **Reading one back is opt-in** (`use_stored_baseline` on the adjudicate
+  request). A null baseline from a client that manages its own memory means
+  "my memory has none for this locator", not "I have no memory", and quietly
+  substituting the fleet's would overrule it — starting with the benchmark,
+  which wipes its memory per suite so that every row it grades is a cold heal.
+
+Measured on one repair, cold then warm: a heuristic score of 0.281 against
+0.918 for the same correct element. That is the difference between a repair
+refused into the review band and a repair applied. Against a live retail
+listing the same repair scored 94% cold and 100% warm, and after a service
+restart the first repair of the next run was already 100%.
+
+Baselines are element fingerprints — tag, attributes, label, ancestor chain,
+bounding box. No page, no DOM, no typed values. They live in
+`run-memory/baselines.json`; `--baselines PATH` moves them, and several
+service processes should share one file or each will learn its own half of
+what the fleet knows.
 
 ## Measured
 
@@ -273,7 +314,14 @@ to the right element" are different questions, and only the second one matters:
 | latency per repair, GPU | ~6 s |
 | latency per repair, CPU | ~8 s |
 
-Two findings from that data worth stating, because both are counter-intuitive:
+**That percentage is only comparable to a run from the same day.** The suites
+are built from live sites, and live sites move. Re-running them months later
+reads 79.8%, entirely because three suites now yield 9-11 gradable locators
+where they once yielded 12 — a control run with the change under test removed
+reproduces the lower figure exactly. Compare against a control you ran
+yourself, never against a number in a file.
+
+Three findings from that data worth stating, because none is obvious:
 
 **The language model has never overridden the ranker.** Across every recorded
 repair: 61 agreements, zero overrides. The model is not selecting the element —
@@ -285,11 +333,21 @@ the round trip would leave correct repairs scoring below the apply threshold,
 so they would stop being applied and start interrupting a human — a worse
 outcome than the latency it saves.
 
+**But "under-confident" had two causes, and only one was calibration.** The
+other was that the deterministic layer was being handed less evidence than it
+should have had: no baseline, and — for clients posting the harvester's own
+field names — attributes silently dropped in transit by a strict decoder. With
+the AI disabled, so the deterministic layer stands alone, that bug had the
+ranker putting the *wrong* element first while the model carried the result.
+Both are fixed. The remaining gap is smaller and differently shaped than the
+one that motivated the calibration work, which is an argument for measuring it
+again before fitting a curve to it.
+
 ## Tests
 
 ```bash
 python tests/test_similarity.py    # 29 - the ranking signals, CSS and XPath
-python tests/test_service.py       # 13 - API contract, decision policy, wire schema
+python tests/test_service.py       # 21 - API contract, decision policy, wire schema, baselines
 ```
 
 Both are **offline by design**: no browser, no service, no model, no network.

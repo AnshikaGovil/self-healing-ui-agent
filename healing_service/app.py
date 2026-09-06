@@ -31,8 +31,9 @@ from bis_core.adjudicator import (PROTOCOL_VERSION, AdjudicationRequest,
 from bis_core.config import HealingConfig
 from bis_core.js_harvest import (DESCRIBE_ONE_JS, HARVEST_JS, PRESENCE_JS,
                                  PROBE_JS)
-from .schemas import (AdjudicateRequest, AdjudicateResponse,
-                      HealthResponse, JsBundleResponse)
+from .baselines import DEFAULT_PATH as DEFAULT_BASELINE_PATH, BaselineStore
+from .schemas import (AdjudicateRequest, AdjudicateResponse, BaselineRequest,
+                      BaselineResponse, HealthResponse, JsBundleResponse)
 
 log = logging.getLogger("bis.service")
 
@@ -57,27 +58,37 @@ SERVICE_VERSION = "1.1.0"
 class ServiceState:
     """Process-wide state: one loaded model, shared by every request."""
 
-    def __init__(self, config: HealingConfig, api_key: str = ""):
+    def __init__(self, config: HealingConfig, api_key: str = "",
+                 baseline_path: str = DEFAULT_BASELINE_PATH):
         self.config = config
         self.api_key = api_key
         self.adjudicator = LocalAdjudicator(config)
+        # Baselines for clients that have no memory of their own. The full
+        # agent keeps its own and sends it inline; this is what stops a thin
+        # client from scoring every heal, forever, with structure and
+        # geometry blank.
+        self.baselines = BaselineStore(baseline_path)
         self.started_at = time.time()
         self.requests = 0
         self.warm = {}
 
 
 def create_app(config: Optional[HealingConfig] = None,
-               api_key: str = "", warm: bool = True) -> FastAPI:
+               api_key: str = "", warm: bool = True,
+               baseline_path: str = "") -> FastAPI:
     """Build the ASGI app. Loading happens at startup, not on first request."""
     config = config or HealingConfig()
     # Environment wins, so a container can be configured without editing code.
     config.model_path = os.environ.get("BIS_MODEL_PATH", config.model_path)
     config.gpu_layers = int(os.environ.get("BIS_GPU_LAYERS", config.gpu_layers))
     api_key = api_key or os.environ.get("BIS_API_KEY", "")
+    baseline_path = (baseline_path
+                     or os.environ.get("BIS_BASELINE_STORE", "")
+                     or DEFAULT_BASELINE_PATH)
     # A service that phoned another service would defeat the point.
     config.service_url = ""
 
-    state = ServiceState(config, api_key)
+    state = ServiceState(config, api_key, baseline_path)
 
     app = FastAPI(
         title="Bot Immune System - Healing Service",
@@ -124,6 +135,7 @@ def create_app(config: Optional[HealingConfig] = None,
             ai=ai,
             uptime_s=round(time.time() - state.started_at, 1),
             requests_served=state.requests,
+            baselines=state.baselines.stats()["entries"],
         )
 
     @app.get("/")
@@ -132,7 +144,8 @@ def create_app(config: Optional[HealingConfig] = None,
             "service": SERVICE_NAME,
             "version": SERVICE_VERSION,
             "protocol": PROTOCOL_VERSION,
-            "endpoints": ["/v1/health", "/v1/js", "/v1/adjudicate", "/docs"],
+            "endpoints": ["/v1/health", "/v1/js", "/v1/adjudicate",
+                          "/v1/baseline", "/docs"],
         })
 
     @app.get("/v1/js", response_model=JsBundleResponse)
@@ -157,6 +170,34 @@ def create_app(config: Optional[HealingConfig] = None,
             presence=JS_BUNDLE["presence"],
         )
 
+    @app.post("/v1/baseline", response_model=BaselineResponse,
+              dependencies=[Depends(require_key)])
+    def record_baseline(body: BaselineRequest) -> BaselineResponse:
+        """Remember what an element looked like while its locator worked.
+
+        Posted by a client after a step succeeds. It is the only thing a
+        thin client can contribute that the service cannot work out for
+        itself: which of the elements on the page the step actually used.
+
+        The store refuses a fingerprint that is not on screen, so a client
+        may post freely and let the policy live in one place.
+        """
+        if body.protocol != PROTOCOL_VERSION:
+            raise HTTPException(
+                status_code=409,
+                detail="protocol %s not supported (service speaks %s)"
+                       % (body.protocol, PROTOCOL_VERSION))
+        stored = state.baselines.record(body.key, body.url, body.descriptor,
+                                        body.selector)
+        if stored:
+            log.info("baseline recorded for %s on %s", body.key,
+                     state.baselines.key(body.key, body.url))
+        return BaselineResponse(
+            stored=stored,
+            reason="" if stored else "the element was not on screen",
+            entries=state.baselines.stats()["entries"],
+        )
+
     @app.post("/v1/adjudicate", response_model=AdjudicateResponse,
               dependencies=[Depends(require_key)])
     def adjudicate(body: AdjudicateRequest) -> AdjudicateResponse:
@@ -176,12 +217,27 @@ def create_app(config: Optional[HealingConfig] = None,
 
         state.requests += 1
         started = time.time()
+        # A client that keeps its own memory sends its baseline inline. One
+        # that does not asks for the service's, and gets it looked up under
+        # the same key the toolkit would have used. Without this, four of the
+        # seven signals are blank on every thin-client heal.
+        #
+        # The asking is deliberate. A None from the full agent means "my
+        # memory has none for this locator", which is not the same as "I have
+        # no memory" - substituting the fleet's would overrule a client that
+        # manages its own, and would silently warm the benchmark, which wipes
+        # its memory per suite precisely so that every row is a cold heal.
+        baseline = body.baseline
+        if not baseline and body.use_stored_baseline:
+            baseline = state.baselines.get(body.locator.key, body.page.url)
+            if baseline:
+                log.info("using a stored baseline for %s", body.locator.key)
         request = AdjudicationRequest(
             locator=body.locator.model_dump(),
             action=body.action,
             page=body.page.model_dump(),
             candidates=body.candidates,
-            baseline=body.baseline,
+            baseline=baseline,
             shortlist_size=body.shortlist_size,
             budget_s=body.budget_s,
         )
@@ -236,6 +292,9 @@ def main() -> int:
     ap.add_argument("--no-ai", action="store_true",
                     help="serve heuristic + semantic ranking only")
     ap.add_argument("--no-warm", action="store_true")
+    ap.add_argument("--baselines", default="",
+                    help="where to keep the baselines thin clients rely on "
+                         "(default run-memory/baselines.json)")
     ap.add_argument("--log-level", default="info")
     args = ap.parse_args()
 
@@ -253,7 +312,9 @@ def main() -> int:
         config.ai_context = args.context
     config.use_ai = not args.no_ai
 
-    application = create_app(config, api_key=args.api_key, warm=not args.no_warm)
+    application = create_app(config, api_key=args.api_key,
+                             warm=not args.no_warm,
+                             baseline_path=args.baselines)
     uvicorn.run(application, host=args.host, port=args.port,
                 log_level=args.log_level)
     return 0

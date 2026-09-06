@@ -174,6 +174,11 @@ class LocalAdjudicator:
             "action": request.action,
             "url": (request.page or {}).get("url", ""),
             "candidates": request.candidates,
+            # The baseline drives the structure and geometry signals, so two
+            # requests that differ only in whether one was available are not
+            # the same question. Leaving it out replays a cold verdict at a
+            # cold confidence over a warm heal that would have scored higher.
+            "baseline": request.baseline,
         }, sort_keys=True, default=str)
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
@@ -246,13 +251,18 @@ class LocalAdjudicator:
 
         decision = AdjudicationDecision()
         spec = spec_from_payload(request.locator)
-        candidates = [ElementDescriptor.from_dict(c) for c in request.candidates]
+        # coerce, not from_dict: the full agent sends serialised descriptors
+        # and a thin client sends the harvester's own output. Decoding the
+        # second shape with from_dict drops id, type, aria-label, data-* and
+        # the accessible name, which is most of what identity and attributes
+        # are scored on.
+        candidates = [ElementDescriptor.coerce(c) for c in request.candidates]
         if not candidates:
             decision.error = "no candidates supplied"
             decision.duration_s = time.time() - started
             return decision
 
-        baseline = (ElementDescriptor.from_dict(request.baseline)
+        baseline = (ElementDescriptor.coerce(request.baseline)
                     if request.baseline else None)
         target = HealTarget(spec=spec, baseline=baseline)
 

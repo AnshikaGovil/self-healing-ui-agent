@@ -16,3 +16,7 @@ dist/
 # Local runtime output
 artifacts/
 *.log
+
+# Baselines the service learns on behalf of thin clients. Run state, and
+# specific to the host that earned it - never part of the deployment.
+run-memory/

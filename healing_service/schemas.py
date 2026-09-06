@@ -34,10 +34,43 @@ class AdjudicateRequest(BaseModel):
     page: PagePayload = Field(default_factory=PagePayload)
     candidates: List[Dict[str, Any]] = Field(default_factory=list)
     baseline: Optional[Dict[str, Any]] = None
+    use_stored_baseline: bool = False
+    """May the service supply a baseline this client did not send?
+
+    Only true for a client with no memory of its own. The full agent keeps
+    its own and a `baseline` of None from it means "I have none for this
+    locator", which is a fact about its memory, not an invitation to
+    substitute the fleet's. The benchmark depends on exactly that: it wipes
+    its memory per suite so every row is a cold heal, and a service that
+    quietly warmed those requests would make the measurement a lie without
+    changing a single line of it."""
+
     optional: bool = False
     shortlist_size: int = 8
     budget_s: float = 25.0
     protocol: str = "1"
+
+
+class BaselineRequest(BaseModel):
+    """A fingerprint of an element a step has just used successfully.
+
+    ``descriptor`` is deliberately untyped. It is whatever the client had:
+    the harvester's own output from a thin client, a serialised
+    ElementDescriptor from the full agent. The service coerces one shape
+    into the other rather than making every client learn the difference.
+    """
+
+    key: str = "locator"
+    selector: str = ""
+    url: str = ""
+    descriptor: Dict[str, Any] = Field(default_factory=dict)
+    protocol: str = "1"
+
+
+class BaselineResponse(BaseModel):
+    stored: bool = False
+    reason: str = ""
+    entries: int = 0
 
 
 class ShortlistItem(BaseModel):
@@ -94,3 +127,7 @@ class HealthResponse(BaseModel):
     ai: Dict[str, Any] = Field(default_factory=dict)
     uptime_s: float = 0.0
     requests_served: int = 0
+    baselines: int = 0
+    """How many locator baselines are held for thin clients. Zero on a fresh
+    service is expected; zero after a fleet has been running is the symptom
+    of clients that are not reporting them."""
