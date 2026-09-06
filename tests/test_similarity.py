@@ -19,9 +19,13 @@ from bis_core.descriptors import (ElementDescriptor,      # noqa: E402
 from bis_core.descriptors import (intent_tokens,           # noqa: E402
                                   normalize_selector,
                                   selector_syntax,
-                                  selector_tag)
+                                  selector_tag,
+                                  selector_uses_id)
 from bis_core.similarity import (HealTarget,              # noqa: E402
+                                 _path_similarity,
+                                 geometry_signal,
                                  identity_signal,
+                                 neighbor_text_signal,
                                  parse_selector_hints,
                                  score_candidates,
                                  selector_hints)
@@ -392,6 +396,162 @@ def test_the_core_imports_nothing_outside_the_standard_library():
                     offenders.append("%s: %s" % (name, mod))
 
     assert not offenders, "bis-core reached outside stdlib: %s" % offenders
+
+
+# ------------------------------------------- what a baseline unlocks
+#
+# Six of the seven signals compare a candidate against the element the step
+# used while its locator still worked. These pin the three that were either
+# newly built or found to be measuring the wrong thing.
+
+
+def test_neighbour_text_scores_the_copy_around_the_element():
+    """The one piece of evidence a wholesale rename cannot touch.
+
+    A design-system bump rewrites every class on the page and leaves the words
+    beside the button where they were. The harvester has always collected that
+    text; until this signal existed nothing scored it.
+    """
+    base = el(tag="input", eid="firstName",
+              neighbor_text="First Name Enter your legal first name")
+    t = HealTarget(spec=LocatorSpec(key="t", selector="#hr-v2-firstName"),
+                   baseline=base)
+
+    same = el(tag="input", eid="firstName",
+              neighbor_text="First Name Enter your legal first name")
+    assert neighbor_text_signal(t, same) == 1.0
+
+    unrelated = el(tag="input", neighbor_text="Payment card expiry month")
+    assert neighbor_text_signal(t, unrelated) < 0.3
+
+    # Long words carry more evidence than short ones: sharing "legal" and
+    # "first" says far more than sharing "your".
+    long_words = el(tag="input", neighbor_text="legal first name")
+    short_words = el(tag="input", neighbor_text="your")
+    assert neighbor_text_signal(t, long_words) > \
+        neighbor_text_signal(t, short_words)
+
+
+def test_neighbour_text_says_nothing_without_a_baseline():
+    """Invariant 1: no evidence reports None, never zero.
+
+    A cold heal has no recorded surroundings to compare against. Scoring that
+    as zero would punish a repair for being the first one.
+    """
+    cold = target("#hr-v2-firstName")
+    assert neighbor_text_signal(cold, el(neighbor_text="anything")) is None
+
+    blank = HealTarget(spec=LocatorSpec(key="t", selector="#x"),
+                       baseline=el(neighbor_text=""))
+    assert neighbor_text_signal(blank, el(neighbor_text="something")) is None
+
+
+def test_geometry_survives_a_scroll_and_a_different_screen():
+    """rect is viewport-relative, so position alone is not a fact about a page.
+
+    The baseline is captured at the top of the page and the candidate is
+    harvested after scrolling to it. Same element, same place in the document,
+    900 pixels apart on screen. Before the scroll offset travelled with the
+    fingerprint, this scored as though the element had moved half a page.
+    """
+    top = el(rect={"x": 100, "y": 200, "width": 120, "height": 40},
+             scroll_x=0, scroll_y=0, viewport_w=1600, viewport_h=900)
+    scrolled = el(rect={"x": 100, "y": -700, "width": 120, "height": 40},
+                  scroll_x=0, scroll_y=900, viewport_w=1600, viewport_h=900)
+    t = HealTarget(spec=LocatorSpec(key="t", selector="#x"), baseline=top)
+    assert geometry_signal(t, scrolled) == 1.0
+
+    # And the same element on a smaller screen is still the same element: the
+    # distance is normalised by the viewport that was actually in use, not by
+    # a constant that only ever described one developer's window.
+    small = el(rect={"x": 100, "y": 200, "width": 120, "height": 40},
+               scroll_x=0, scroll_y=0, viewport_w=1280, viewport_h=720)
+    t_small = HealTarget(spec=LocatorSpec(key="t", selector="#x"),
+                         baseline=small)
+    assert geometry_signal(t_small, small) == 1.0
+
+    # A fingerprint recorded before those fields existed reports zero for all
+    # of them, and must degrade rather than divide by nothing.
+    old = el(rect={"x": 100, "y": 200, "width": 120, "height": 40})
+    t_old = HealTarget(spec=LocatorSpec(key="t", selector="#x"), baseline=old)
+    assert geometry_signal(t_old, old) == 1.0
+
+
+def test_paths_are_compared_by_step_not_by_character():
+    """Edit distance over an absolute XPath measures mostly punctuation.
+
+    It was also 47% of the entire ranking cost. Steps are the unit that means
+    something, and matching from the leaf back up is how a redesign actually
+    moves an element: the wrappers near the root get rewritten, the immediate
+    surroundings usually do not.
+    """
+    a = "/html[1]/body[1]/div[2]/form[1]/div[3]/input[1]"
+    assert _path_similarity(a, a) == 1.0
+
+    # One wrapper renumbered near the root: most of the path still agrees.
+    reshuffled = "/html[1]/body[1]/div[5]/form[1]/div[3]/input[1]"
+    assert _path_similarity(a, reshuffled) > 0.6
+
+    # A different element entirely, sharing only the document root.
+    elsewhere = "/html[1]/body[1]/header[1]/nav[1]/a[4]"
+    assert _path_similarity(a, elsewhere) < 0.3
+    assert _path_similarity("", a) == 0.0
+
+
+def test_the_identity_short_circuit_changes_speed_and_not_answers():
+    """difflib's cheap bounds are exact, so skipping on them is safe.
+
+    real_quick_ratio() >= quick_ratio() >= ratio(), so a pair whose upper
+    bound is already below the best seen can never win. Getting the *pair
+    order* wrong while optimising this silently changed every score, because
+    ratio() is not symmetric - hence this test.
+    """
+    from difflib import SequenceMatcher
+
+    def naive(t, cand):
+        wanted = t.target_identifiers()
+        if not wanted:
+            return None
+        have = [collapse_digits(cand.element_id.lower())] if cand.element_id else []
+        have += [collapse_digits(c.lower()) for c in cand.classes]
+        have = [h for h in have if len(h) > 2]
+        if not have:
+            return 0.0
+        best = 0.0
+        for w in wanted:
+            for h in have:
+                if w == h:
+                    return 1.0
+                best = max(best, SequenceMatcher(None, w, h).ratio())
+        return best ** 3
+
+    t = target(".pd19-product-card__item")
+    for cand in (el(classes=["pd21-product-card__item"]),
+                 el(classes=["pd21-product-card__title", "js-card"]),
+                 el(eid="product-card-item"),
+                 el(classes=["totally-unrelated-banner"]),
+                 el(classes=[])):
+        assert identity_signal(t, cand) == naive(t, cand), cand.classes
+
+
+def test_a_repair_keeps_the_shape_the_developer_wrote():
+    """An author who avoided ids has told us something about the application.
+
+    Usually that its ids are framework-generated and do not survive a deploy.
+    Handing that developer an id-based repair overrides knowledge they have
+    and we do not, and it is also the code they will have to review.
+    """
+    assert selector_uses_id("#firstName")
+    assert selector_uses_id("input#firstName")
+    assert selector_uses_id("div#main .row")
+    assert selector_uses_id("xpath=//input[@id='firstName']")
+
+    # A '#' inside an attribute value is a fragment, not an id.
+    assert not selector_uses_id('a[href="#top"]')
+    assert not selector_uses_id("div.card > a.title")
+    assert not selector_uses_id(".pd19-product-card__item")
+    assert not selector_uses_id("xpath=//div[@class='card']")
+    assert not selector_uses_id("")
 
 
 def _run_all():

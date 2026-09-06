@@ -6,14 +6,21 @@ module alone must be able to find the right element for the common failure
 modes (renamed classes, version-bumped design systems, moved nodes), so that
 the system degrades gracefully to pure heuristics if the model is offline.
 
-Six independent signals are combined:
+Eight independent signals are combined, seven of them deterministic:
 
+    identity   - survival of the exact normalised id or component class name
     tag        - tag / ARIA-role compatibility
     attributes - id, name, class and data-* token overlap (digit-normalised)
     text       - visible and accessible text similarity
     structure  - DOM path and ancestor-chain similarity
-    geometry   - on-screen position and size vs a recorded baseline
+    neighbor   - the page copy around the element, vs the baseline's
+    geometry   - document position and size vs a recorded baseline
     semantic   - embedding cosine between business intent and the element
+
+Seven of the eight draw on a *baseline* - a fingerprint of the element taken
+while the locator still worked. Only ``semantic`` is independent of one, which
+is why a cold heal is scored on a fraction of the total weight and why a
+successful step is worth recording.
 
 Signals that have no evidence to work from (e.g. geometry on a first run)
 report ``None`` and are dropped from the weighted mean rather than scored as
@@ -284,12 +291,34 @@ def identity_signal(target: HealTarget, cand: ElementDescriptor) -> Optional[flo
     have = [h for h in have if len(h) > 2]
     if not have:
         return 0.0
+    # Only the best pair matters, so a pair whose *upper bound* is already
+    # below the best seen never needs its real ratio computed. difflib
+    # guarantees real_quick_ratio() >= quick_ratio() >= ratio(), so this is a
+    # short circuit and not an approximation - the answer is identical.
+    # Worth the three lines: this signal is called once per candidate for up
+    # to 900 candidates on every heal, on the machine that has no accelerator.
+    # Only the best pair matters, so a pair whose *upper bound* is already
+    # below the best seen never needs its real ratio computed. difflib
+    # guarantees real_quick_ratio() >= quick_ratio() >= ratio(), so this is a
+    # short circuit, not an approximation - the answer is identical.
+    #
+    # The loops are the other way round from the obvious reading on purpose.
+    # ratio() is *not* symmetric, so the pair has to stay (wanted, have); but
+    # the index difflib builds is over the second sequence, so iterating
+    # `have` outside is what lets set_seq2 be paid once instead of once per
+    # pair. Getting this backwards silently changes every score, which is how
+    # it was caught.
     best = 0.0
-    for w in wanted:
-        for h in have:
+    matcher = SequenceMatcher(None, "", "")
+    for h in have:
+        matcher.set_seq2(h)
+        for w in wanted:
             if w == h:
                 return 1.0
-            ratio = SequenceMatcher(None, w, h).ratio()
+            matcher.set_seq1(w)
+            if matcher.real_quick_ratio() <= best or                     matcher.quick_ratio() <= best:
+                continue
+            ratio = matcher.ratio()
             if ratio > best:
                 best = ratio
     return best ** 3
@@ -370,6 +399,70 @@ def text_signal(target: HealTarget, cand: ElementDescriptor) -> Optional[float]:
     return max(0.0, min(1.0, 0.7 * ratio + 0.3 * _jaccard(ref_w, got_w)))
 
 
+def _path_similarity(a: str, b: str) -> float:
+    """Agreement between two absolute XPaths, compared step by step.
+
+    This was a character-level SequenceMatcher over the two path strings,
+    which was 47% of the entire ranking cost - the single most expensive
+    thing the bot does on a heal - and it was measuring the wrong thing:
+    edit distance over "/html[1]/body[1]/div[3]" is dominated by the tags
+    and the punctuation that every path on the page shares.
+
+    Steps are the unit that means something. Matching from the leaf back up
+    also matches how a redesign moves an element: the wrapper divs near the
+    root are rewritten, the immediate surroundings usually are not.
+    """
+    if not a or not b:
+        return 0.0
+    pa = [s for s in a.split("/") if s]
+    pb = [s for s in b.split("/") if s]
+    if not pa or not pb:
+        return 0.0
+    common = 0.0
+    for x, y in zip(reversed(pa), reversed(pb)):
+        if x == y:
+            common += 1.0
+        elif x.split("[")[0] == y.split("[")[0]:
+            common += 0.5      # same tag, different position among siblings
+        else:
+            break
+    return max(0.0, min(1.0, common / max(len(pa), len(pb))))
+
+
+def neighbor_text_signal(target: HealTarget,
+                         cand: ElementDescriptor) -> Optional[float]:
+    """Agreement between the copy *surrounding* the baseline and the candidate.
+
+    The one piece of evidence a wholesale rename cannot touch. A design-system
+    bump rewrites every class on the page and leaves the words next to the
+    button exactly where they were, which is precisely the case this system
+    exists for - and the harvester has been collecting the text for it all
+    along without anything scoring it.
+
+    Word containment weighted by word *length*, after Similo, which ranks this
+    property in its top band alongside tag, name, id and visible text. Length
+    weighting is what stops "the" and "a" from carrying the same evidence as
+    "Delivery" - a long word shared by two elements is a far stronger claim
+    that they play the same role than a short one.
+    """
+    base = target.baseline
+    if not base:
+        return None
+    ref = normalize_text(base.neighbor_text).lower()
+    got = normalize_text(cand.neighbor_text).lower()
+    if not ref:
+        return None
+    if not got:
+        return 0.0
+    ref_words = [w for w in ref.split() if w]
+    got_words = set(got.split())
+    if not ref_words:
+        return None
+    matched = sum(len(w) for w in ref_words if w in got_words)
+    total = sum(len(w) for w in ref_words)
+    return max(0.0, min(1.0, matched / total)) if total else None
+
+
 def structure_signal(target: HealTarget, cand: ElementDescriptor) -> Optional[float]:
     """How similar the element's position in the DOM tree is to the baseline.
 
@@ -395,7 +488,7 @@ def structure_signal(target: HealTarget, cand: ElementDescriptor) -> Optional[fl
             else:
                 break
         chain = common / max(len(a), len(b), 1)
-    xp = SequenceMatcher(None, base.xpath, cand.xpath).ratio() if base.xpath else 0.0
+    xp = _path_similarity(base.xpath, cand.xpath) if base.xpath else 0.0
     depth_pen = 1.0 - min(abs(base.depth - cand.depth) / 8.0, 1.0)
     return max(0.0, min(1.0, 0.55 * chain + 0.30 * xp + 0.15 * depth_pen))
 
@@ -414,11 +507,23 @@ def geometry_signal(target: HealTarget, cand: ElementDescriptor) -> Optional[flo
     cw, ch = cand.rect.get("width", 0), cand.rect.get("height", 0)
     if bw <= 0 or bh <= 0 or cw <= 0 or ch <= 0:
         return None
-    bx = base.rect.get("x", 0) + bw / 2.0
-    by = base.rect.get("y", 0) + bh / 2.0
-    cx = cand.rect.get("x", 0) + cw / 2.0
-    cy = cand.rect.get("y", 0) + ch / 2.0
-    diag = (1600.0 ** 2 + 900.0 ** 2) ** 0.5
+    # Document coordinates, not viewport coordinates. `rect` comes from
+    # getBoundingClientRect, so a baseline captured at the top of a page and a
+    # candidate harvested after scrolling to the footer would otherwise look
+    # like the element had moved the height of the page.
+    bx = base.rect.get("x", 0) + base.scroll_x + bw / 2.0
+    by = base.rect.get("y", 0) + base.scroll_y + bh / 2.0
+    cx = cand.rect.get("x", 0) + cand.scroll_x + cw / 2.0
+    cy = cand.rect.get("y", 0) + cand.scroll_y + ch / 2.0
+    # The real viewport, when the fingerprint carries one. A fixed 1600x900
+    # was here for a long time under a docstring promising resolution
+    # independence, which meant every bot not running at that size was scored
+    # against a window it did not have. Fingerprints recorded before the
+    # fields existed report zero, and fall back to the old constant rather
+    # than to a guess.
+    vw = max(base.viewport_w, cand.viewport_w) or 1600.0
+    vh = max(base.viewport_h, cand.viewport_h) or 900.0
+    diag = (vw ** 2 + vh ** 2) ** 0.5
     dist = ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5
     pos = max(0.0, 1.0 - dist / (diag * 0.55))
     size = min(bw, cw) / max(bw, cw) * min(bh, ch) / max(bh, ch)
@@ -496,6 +601,7 @@ def score_candidates(
             "text": text_signal(target, cand),
             "structure": structure_signal(target, cand),
             "geometry": geometry_signal(target, cand),
+            "neighbor": neighbor_text_signal(target, cand),
             "semantic": semantic_scores[i] if semantic_scores else None,
         }
         weight_map = {
@@ -505,6 +611,7 @@ def score_candidates(
             "text": weights.text,
             "structure": weights.structure,
             "geometry": weights.geometry,
+            "neighbor": weights.neighbor,
             "semantic": weights.semantic,
         }
         total_w = sum(weight_map[k] for k, v in signals.items() if v is not None)

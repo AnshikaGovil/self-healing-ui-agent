@@ -27,6 +27,7 @@ class ScoringWeights:
     text: float = 0.18         # visible + accessible text similarity
     structure: float = 0.10    # DOM path and ancestor-chain similarity
     geometry: float = 0.08     # on-screen position and size (needs a baseline)
+    neighbor: float = 0.10     # surrounding page copy (needs a baseline)
     semantic: float = 0.14     # embedding cosine vs the business intent
 
 

@@ -10,16 +10,26 @@ string) is a deliberate design choice: every selector we later apply provably
 came from a real element, so the model can only *choose*, never *hallucinate*.
 """
 
-HARVEST_JS = r"""
-(opts) => {
-  const MAX = opts.maxCandidates || 900;
-  const SKIP = new Set(['SCRIPT','STYLE','LINK','META','HEAD','NOSCRIPT',
-                        'TEMPLATE','BR','HR','PATH','G','DEFS','SVG','USE',
-                        'SOURCE','TITLE','CIRCLE','RECT','POLYGON','LINE']);
+
+# One description of an element, spliced into both entry points below.
+#
+# It used to be implemented twice - here for candidates, and again inside
+# DESCRIBE_ONE_JS for baselines - and the two drifted. Measured over 738
+# interactive elements on four live sites, they disagreed about `visible` 40%
+# of the time and about `neighborText` 46%, and the baseline copy derived no
+# accessible name from a <label>, which on a login form is every field.
+#
+# Worse than the disagreement was where it landed. Both the service store and
+# the agent refuse a baseline that is not `visible`, and the baseline copy
+# defined that as "has a box" - which is what the other half of the same guard
+# already checked. The visibility test invariant 12 describes was not running
+# on that path at all.
+#
+# A candidate and a baseline are compared field against field. They have to be
+# produced by the same code, so there is one copy of it.
+_DESCRIBE_JS = r"""
   const INTERACTIVE = new Set(['A','BUTTON','INPUT','SELECT','TEXTAREA',
                                'LABEL','SUMMARY','OPTION']);
-  const root = opts.scope ? document.querySelector(opts.scope) : document.body;
-  if (!root) return {error: 'scope-not-found', candidates: []};
 
   const clean = (s) => (s || '').toString().replace(/\s+/g, ' ').trim();
 
@@ -76,14 +86,100 @@ HARVEST_JS = r"""
   // Text that surrounds the element - a strong disambiguator when class names
   // have been rewritten wholesale but the page copy has not.
   const neighborText = (el) => {
-    const p = el.parentElement;
-    if (!p) return '';
+    // Climb until the surroundings actually say something. Stopping at the
+    // immediate parent leaves this empty for 77% of the interactive elements
+    // on real pages - a form control usually sits alone in a layout div and
+    // its label is a level or two up. Three hops takes that to 25%.
+    //
+    // Climbing further is deliberately not done. The higher you go the more
+    // generic the text becomes, until every control in a section shares it,
+    // and text shared by fifty candidates discriminates between none of them.
     const own = clean(el.innerText);
-    let t = clean(p.innerText);
-    if (own && t.startsWith(own)) t = t.slice(own.length);
-    return clean(t).slice(0, 90);
+    let p = el.parentElement, hops = 0;
+    while (p && hops++ < 3) {
+      let t = clean(p.innerText);
+      if (own && t.startsWith(own)) t = t.slice(own.length);
+      t = clean(t);
+      if (t.length >= 2) return t.slice(0, 90);
+      p = p.parentElement;
+    }
+    return '';
   };
 
+  const describe = (el) => {
+    const r = el.getBoundingClientRect();
+    const cs = window.getComputedStyle(el);
+    const visible = r.width > 0 && r.height > 0 &&
+                    cs.visibility !== 'hidden' && cs.display !== 'none' &&
+                    parseFloat(cs.opacity || '1') > 0.05;
+    const data = {};
+    for (const a of el.attributes || []) {
+      if (a.name.startsWith('data-') && a.value && a.value.length < 60)
+        data[a.name] = a.value;
+    }
+    const ancestors = [];
+    let p = el.parentElement, guard = 0;
+    while (p && guard++ < 8) {
+      const c = stableClasses(p)[0];
+      ancestors.unshift(p.tagName.toLowerCase() + (c ? '.' + c : ''));
+      p = p.parentElement;
+    }
+    let idx = 1, sib = el.previousElementSibling;
+    while (sib) { if (sib.tagName === el.tagName) idx++; sib = sib.previousElementSibling; }
+    return {
+      tag: el.tagName.toLowerCase(),
+      id: el.id || '',
+      classes: Array.from(el.classList || []),
+      name: el.getAttribute('name') || '',
+      type: el.getAttribute('type') || '',
+      role: el.getAttribute('role') || '',
+      ariaLabel: el.getAttribute('aria-label') || '',
+      placeholder: el.getAttribute('placeholder') || '',
+      title: el.getAttribute('title') || '',
+      alt: el.getAttribute('alt') || '',
+      href: (el.getAttribute('href') || '').slice(0, 120),
+      value: (el.value || '').toString().slice(0, 60),
+      dataAttrs: data,
+      text: clean(el.innerText).slice(0, 160),
+      accName: accName(el),
+      xpath: absXPath(el),
+      cssPath: cssPath(el),
+      ancestors: ancestors,
+      depth: ancestors.length,
+      sibIndex: idx,
+      rect: {x: r.x, y: r.y, width: r.width, height: r.height},
+      // getBoundingClientRect is viewport-relative, so a rect alone cannot be
+      // compared across a scroll or across two screen sizes. The scroll offset
+      // makes the position absolute; the viewport makes the distance between
+      // two positions mean the same thing on a laptop and on a 4K panel.
+      scrollX: Math.round(window.scrollX || window.pageXOffset || 0),
+      scrollY: Math.round(window.scrollY || window.pageYOffset || 0),
+      viewportW: window.innerWidth || 0,
+      viewportH: window.innerHeight || 0,
+      visible: visible,
+      enabled: !el.disabled && el.getAttribute('aria-disabled') !== 'true',
+      // reuse the style object captured above - a second getComputedStyle
+      // call here forces a fresh style recalc on every harvested element,
+      // which on a page this size costs more than the rest of the harvest
+      interactive: INTERACTIVE.has(el.tagName) || !!el.onclick ||
+                   ['button','link','textbox','searchbox','tab','menuitem','checkbox']
+                     .indexOf(el.getAttribute('role')) >= 0 ||
+                   cs.cursor === 'pointer',
+      neighborText: neighborText(el)
+    };
+  };
+"""
+
+
+HARVEST_JS = r"""
+(opts) => {
+  const MAX = opts.maxCandidates || 900;
+  const SKIP = new Set(['SCRIPT','STYLE','LINK','META','HEAD','NOSCRIPT',
+                        'TEMPLATE','BR','HR','PATH','G','DEFS','SVG','USE',
+                        'SOURCE','TITLE','CIRCLE','RECT','POLYGON','LINE']);
+  const root = opts.scope ? document.querySelector(opts.scope) : document.body;
+  if (!root) return {error: 'scope-not-found', candidates: []};
+""" + _DESCRIBE_JS + r"""
   // Ranked selector proposals, most durable first.  The healer validates each
   // against the live DOM and keeps the first that resolves to this element.
   //
@@ -153,12 +249,26 @@ HARVEST_JS = r"""
     //     price cell healed to //div[normalize-space()='Rs 65,150'] resolves
     //     perfectly today and breaks the next time the price moves, which for
     //     a price monitor is the one thing guaranteed to happen.
+    // Rejecting every label with a digit in it was too blunt. It threw away
+    // "Add to cart (3)" and "Step 2 of 4" along with "Rs 65,150", so any
+    // control carrying a count or a badge had no text tier at all. Strip the
+    // number and keep the words instead - after Playwright, which offers the
+    // stripped form and prefers it. A label that is *only* a value still has
+    // nothing left once the digits go, so it drops out on its own.
+    const stripNumbers = (t) => clean(t
+        .replace(/^[\s\u20b9$\u20ac\u00a3\u00a5]*[\d.,]+\s*/, '')
+        .replace(/\s*[\u20b9$\u20ac\u00a3\u00a5]?[\d.,]+\s*$/, ''));
     const label = clean(el.innerText);
-    const looksLikeAValue = /\d/.test(label) ||
-        /[₹$€£¥]/.test(label);
-    if (label && label.length <= 40 && !looksLikeAValue) {
-      const lit = xpLit(label);
-      if (lit) pair(null, '//' + tag + '[normalize-space()=' + lit + ']');
+    for (const t of [label, stripNumbers(label)]) {
+      // Still no binding to a value: a price cell healed to
+      // //div[normalize-space()='Rs 65,150'] resolves today and breaks the
+      // next time the price moves, which for a price monitor is guaranteed.
+      if (!t || t.length > 40 || /[\d\u20b9$\u20ac\u00a3\u00a5]/.test(t)) continue;
+      const lit = xpLit(t);
+      if (lit) {
+        pair(null, '//' + tag + '[normalize-space()=' + lit + ']');
+        break;
+      }
     }
     pair(cssPath(el), absXPath(el));
 
@@ -171,61 +281,6 @@ HARVEST_JS = r"""
       for (const s of ordered) if (s) out.push(s);
     }
     return out.filter((v, i, arr) => v && arr.indexOf(v) === i);
-  };
-
-  const describe = (el) => {
-    const r = el.getBoundingClientRect();
-    const cs = window.getComputedStyle(el);
-    const visible = r.width > 0 && r.height > 0 &&
-                    cs.visibility !== 'hidden' && cs.display !== 'none' &&
-                    parseFloat(cs.opacity || '1') > 0.05;
-    const data = {};
-    for (const a of el.attributes || []) {
-      if (a.name.startsWith('data-') && a.value && a.value.length < 60)
-        data[a.name] = a.value;
-    }
-    const ancestors = [];
-    let p = el.parentElement, guard = 0;
-    while (p && guard++ < 8) {
-      const c = stableClasses(p)[0];
-      ancestors.unshift(p.tagName.toLowerCase() + (c ? '.' + c : ''));
-      p = p.parentElement;
-    }
-    let idx = 1, sib = el.previousElementSibling;
-    while (sib) { if (sib.tagName === el.tagName) idx++; sib = sib.previousElementSibling; }
-    return {
-      tag: el.tagName.toLowerCase(),
-      id: el.id || '',
-      classes: Array.from(el.classList || []),
-      name: el.getAttribute('name') || '',
-      type: el.getAttribute('type') || '',
-      role: el.getAttribute('role') || '',
-      ariaLabel: el.getAttribute('aria-label') || '',
-      placeholder: el.getAttribute('placeholder') || '',
-      title: el.getAttribute('title') || '',
-      alt: el.getAttribute('alt') || '',
-      href: (el.getAttribute('href') || '').slice(0, 120),
-      value: (el.value || '').toString().slice(0, 60),
-      dataAttrs: data,
-      text: clean(el.innerText).slice(0, 160),
-      accName: accName(el),
-      xpath: absXPath(el),
-      cssPath: cssPath(el),
-      ancestors: ancestors,
-      depth: ancestors.length,
-      sibIndex: idx,
-      rect: {x: r.x, y: r.y, width: r.width, height: r.height},
-      visible: visible,
-      enabled: !el.disabled && el.getAttribute('aria-disabled') !== 'true',
-      // reuse the style object captured above - a second getComputedStyle
-      // call here forces a fresh style recalc on every harvested element,
-      // which on a page this size costs more than the rest of the harvest
-      interactive: INTERACTIVE.has(el.tagName) || !!el.onclick ||
-                   ['button','link','textbox','searchbox','tab','menuitem','checkbox']
-                     .indexOf(el.getAttribute('role')) >= 0 ||
-                   cs.cursor === 'pointer',
-      neighborText: neighborText(el)
-    };
   };
 
   // ---- collect ------------------------------------------------------------
@@ -314,6 +369,8 @@ PROBE_JS = r"""
 """
 
 
+# The baseline fingerprinter: resolve one element, then hand it to the same
+# describe() every candidate goes through.
 DESCRIBE_ONE_JS = r"""
 (opts) => {
   const selector = opts.selector;
@@ -342,59 +399,8 @@ DESCRIBE_ONE_JS = r"""
     }) || nodes[0];
   } catch (e) { return null; }
   if (!el) return null;
-
-  const clean = (s) => (s || '').toString().replace(/\s+/g, ' ').trim();
-  const r = el.getBoundingClientRect();
-  const VOLATILE = /^(is-|has-|ng-|v-|active$|open$|show$|hide$|hidden$|selected$)/i;
-
-  const parts = [];
-  let node = el;
-  while (node && node.nodeType === 1 && parts.length < 14) {
-    let i = 1, sib = node.previousElementSibling;
-    while (sib) { if (sib.tagName === node.tagName) i++; sib = sib.previousElementSibling; }
-    parts.unshift(node.tagName.toLowerCase() + '[' + i + ']');
-    node = node.parentElement;
-  }
-
-  const ancestors = [];
-  let p = el.parentElement, guard = 0;
-  while (p && guard++ < 8) {
-    const c = Array.from(p.classList || []).filter(x => !VOLATILE.test(x))[0];
-    ancestors.unshift(p.tagName.toLowerCase() + (c ? '.' + c : ''));
-    p = p.parentElement;
-  }
-
-  const data = {};
-  for (const a of el.attributes || []) {
-    if (a.name.startsWith('data-') && a.value && a.value.length < 60)
-      data[a.name] = a.value;
-  }
-
-  return {
-    tag: el.tagName.toLowerCase(),
-    id: el.id || '',
-    classes: Array.from(el.classList || []),
-    name: el.getAttribute('name') || '',
-    type: el.getAttribute('type') || '',
-    role: el.getAttribute('role') || '',
-    ariaLabel: el.getAttribute('aria-label') || '',
-    placeholder: el.getAttribute('placeholder') || '',
-    title: el.getAttribute('title') || '',
-    alt: el.getAttribute('alt') || '',
-    href: (el.getAttribute('href') || '').slice(0, 120),
-    dataAttrs: data,
-    text: clean(el.innerText).slice(0, 160),
-    accName: clean(el.getAttribute('aria-label') || el.getAttribute('alt')
-                   || el.getAttribute('title') || el.getAttribute('placeholder') || ''),
-    xpath: '/' + parts.join('/'),
-    ancestors: ancestors,
-    depth: ancestors.length,
-    rect: {x: r.x, y: r.y, width: r.width, height: r.height},
-    visible: r.width > 0 && r.height > 0,
-    enabled: !el.disabled,
-    interactive: ['A','BUTTON','INPUT','SELECT','TEXTAREA'].indexOf(el.tagName) >= 0,
-    neighborText: el.parentElement ? clean(el.parentElement.innerText).slice(0, 90) : ''
-  };
+""" + _DESCRIBE_JS + r"""
+  return describe(el);
 }
 """
 

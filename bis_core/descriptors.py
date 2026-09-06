@@ -250,6 +250,25 @@ def intent_tokens(description):
 _SELECTOR_CHARS = set("[]()#>+~=" + chr(34) + chr(39) + "@ " + chr(9))
 
 
+def selector_uses_id(selector) -> bool:
+    """Does this selector identify its element by id?
+
+    Covers the CSS form (``#foo``, ``input#foo``) and the XPath one
+    (``//input[@id='foo']``). Used to compare what the *author* wrote against
+    what the page proposes.
+    """
+    body = strip_syntax_prefix(selector or "")
+    if not body:
+        return False
+    if selector_syntax(selector) == SYNTAX_XPATH:
+        return "@id" in body.lower()
+    # A '#' inside an attribute value or a pseudo-class argument is not an id
+    # selector - `a[href="#top"]` says nothing about ids - so ignore anything
+    # in brackets or quotes before looking.
+    bare = re.sub(r"\[[^\]]*\]|'[^']*'|\"[^\"]*\"", " ", body)
+    return "#" in bare
+
+
 def looks_like_selector(value) -> bool:
     """Is this string a selector written inline, rather than a locator key?
 
@@ -405,7 +424,8 @@ class LocatorSpec:
 # Their presence is what tells the two wire shapes apart - see
 # ElementDescriptor.coerce().
 _JS_ONLY_KEYS = ("ariaLabel", "dataAttrs", "accName", "cssPath", "sibIndex",
-                 "neighborText")
+                 "neighborText", "scrollX", "scrollY", "viewportW",
+                 "viewportH")
 
 
 @dataclass
@@ -433,6 +453,16 @@ class ElementDescriptor:
     depth: int = 0
     sibling_index: int = 0
     rect: Dict[str, float] = field(default_factory=dict)
+    scroll_x: float = 0.0
+    scroll_y: float = 0.0
+    viewport_w: float = 0.0
+    viewport_h: float = 0.0
+    """Where the page was scrolled to, and how big the window was, when this
+    element was described. ``rect`` is viewport-relative, so without these two
+    a baseline taken at the top of a page and a candidate harvested after
+    scrolling look like the element moved. Zero means an older fingerprint
+    that predates the fields; geometry_signal falls back rather than guess."""
+
     visible: bool = True
     enabled: bool = True
     interactive: bool = False
@@ -551,6 +581,10 @@ class ElementDescriptor:
             depth=int(raw.get("depth") or 0),
             sibling_index=int(raw.get("sibIndex") or 0),
             rect=raw.get("rect") or {},
+            scroll_x=float(raw.get("scrollX") or 0),
+            scroll_y=float(raw.get("scrollY") or 0),
+            viewport_w=float(raw.get("viewportW") or 0),
+            viewport_h=float(raw.get("viewportH") or 0),
             visible=bool(raw.get("visible")),
             enabled=bool(raw.get("enabled", True)),
             interactive=bool(raw.get("interactive")),

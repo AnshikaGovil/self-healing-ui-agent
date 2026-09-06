@@ -36,9 +36,10 @@ weighted, with a language model as one voice among several:
 | attributes | 0.18 | id, name, class and `data-*` token overlap |
 | text | 0.18 | visible and accessible text similarity |
 | semantic | 0.14 | sentence-embedding distance from the step's stated intent |
-| structure | 0.10 | DOM path and ancestor chain |
+| structure | 0.10 | DOM path and ancestor chain, compared step by step |
+| neighbour | 0.10 | the page copy *around* the element, word overlap weighted by word length |
 | tag | 0.08 | tag and ARIA-role compatibility |
-| geometry | 0.08 | on-screen position and size |
+| geometry | 0.08 | position and size, in document coordinates, normalised by the real viewport |
 
 A local GGUF model then adjudicates the shortlist and its verdict is fused in
 at a weight of 0.35. It is deliberately not the decision-maker — see
@@ -48,6 +49,11 @@ at a weight of 0.35. It is deliberately not the decision-maker — see
 same token and `v3` and `v4` are the same component. That single rule is the
 highest-yield signal against real redesigns, because versioned class names are
 how most front ends actually break.
+
+**The neighbour signal is the one a rename cannot touch.** A design-system
+bump rewrites every class on the page and leaves the words beside the button
+exactly where they were. Word overlap is weighted by word *length*, so sharing
+"Delivery" counts for more than sharing "the".
 
 ## Architecture
 
@@ -59,7 +65,7 @@ Everything that needs a **browser** runs on the bot; everything that needs an
 flowchart LR
     subgraph BOT["Bot - many, no GPU"]
         A["step fails"] --> B["harvest the live DOM<br/>~900 elements"]
-        B --> C["lexical pre-rank<br/>5 signals, no model"]
+        B --> C["lexical pre-rank<br/>7 signals, no model"]
         F["bind + validate<br/>the selector"] --> G["apply / escalate / refuse"]
     end
 
@@ -100,6 +106,18 @@ otherwise a first-time repair is punished for having no history.
 `auto_apply_threshold` a repair is applied; between that and
 `review_threshold` a human is asked; below it the agent refuses and the step
 fails loudly. Refusing to guess is a feature.
+
+**A candidate and a baseline are described by the same code.** Every signal
+compares one fingerprint against another field by field, so there is exactly
+one `describe()` and both the harvester and the baseline fingerprinter splice
+it in. This was two implementations that had quietly drifted: measured over
+738 interactive elements on four live sites they disagreed about `visible` 40%
+of the time and about `neighborText` 46%, and the baseline copy derived no
+accessible name from a `<label>` — which on a login form is every field.
+The worst of it was not the weaker score but a guard that had stopped running:
+a baseline that is not visible is supposed to be refused, and the baseline
+copy defined "visible" as "has a box", which the other half of the same check
+already covered.
 
 **Everything fails open.** An unreachable service, a missing model or
 malformed output degrades to "no opinion" and the deterministic signals stand.
@@ -262,9 +280,9 @@ redeploy to every bot in the fleet. Clients cache it against the content hash.
 
 `/v1/baseline` is what keeps a thin client from being permanently cold.
 
-Six of the seven ranking signals compare a candidate against the element the
-step used *while the locator still worked*. Structure and geometry have
-nothing to compare against without such a record; tag and text fall back to
+Seven of the eight ranking signals compare a candidate against the element the
+step used *while the locator still worked*. Structure, geometry and neighbour
+have nothing to compare against without such a record; tag and text fall back to
 whatever can be read out of the selector string, which for a bare `#firstName`
 is nothing at all. Signals with no evidence are dropped from the weighted mean
 — correctly, since scoring them zero would punish a repair for being the first
@@ -311,8 +329,10 @@ to the right element" are different questions, and only the second one matters:
 | | |
 | --- | --- |
 | correct element | **86.9%** of 84 locators |
+| wrong element | 9.6% |
 | latency per repair, GPU | ~6 s |
 | latency per repair, CPU | ~8 s |
+| deterministic ranking, 900 candidates | 131 ms cold, 261 ms warm |
 
 **That percentage is only comparable to a run from the same day.** The suites
 are built from live sites, and live sites move. Re-running them months later
@@ -320,6 +340,15 @@ reads 79.8%, entirely because three suites now yield 9-11 gradable locators
 where they once yielded 12 — a control run with the change under test removed
 reproduces the lower figure exactly. Compare against a control you ran
 yourself, never against a number in a file.
+
+The number that moved most recently is the one that matters most for safety.
+Across a change set that unified the fingerprint, added the neighbour signal
+and taught the ranker to keep the shape the developer wrote, **no suite got
+worse**, correct held flat, and **wrong-element fell from 11.9% to 9.6%**.
+Read that as a direction rather than a precision: two repairs out of eighty-odd
+on sites that visibly drift between runs is not a large enough sample to call
+a 2.3-point improvement exact. What it establishes is that the change set went
+in without costing correctness anywhere.
 
 Three findings from that data worth stating, because none is obvious:
 
@@ -346,7 +375,7 @@ again before fitting a curve to it.
 ## Tests
 
 ```bash
-python tests/test_similarity.py    # 29 - the ranking signals, CSS and XPath
+python tests/test_similarity.py    # 35 - the ranking signals, CSS and XPath
 python tests/test_service.py       # 21 - API contract, decision policy, wire schema, baselines
 ```
 
@@ -366,7 +395,7 @@ for torch, that cost lands on every automation host for no reason.
 bis_core/            the shared core - pure standard library, no dependencies
   config.py          every tunable, and the confidence-band policy
   descriptors.py     LocatorSpec / ElementDescriptor, tokenising, digit collapsing
-  similarity.py      the six deterministic signals, selector mining
+  similarity.py      the seven deterministic signals, selector mining
   adjudicator.py     the wire contract, and local / remote implementations
   js_harvest.py      in-page JS: fingerprinting, selector proposal, probes
   runtime.py         the slots the accelerator half plugs into
